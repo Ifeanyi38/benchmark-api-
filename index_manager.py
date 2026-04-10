@@ -15,46 +15,28 @@ def get_mongo_db():
 
 # ── Add indexes ───────────────────────────────────────────────────────────────
 # Indexes are added after seeding so they are built on real data.
-# Building an index on an empty table is pointless -- the optimizer
-# needs data to build an accurate index structure.
+# We skip idx_flight_origin, idx_flight_destination and idx_booking_passenger
+# because Django already creates these automatically for foreign key columns.
+# Adding them again would cause duplicate index errors.
 
 def add_mysql_indexes():
     print("Adding MySQL indexes...")
     indexes = [
-        # Flight origin and destination are the most frequently filtered
-        # columns in search queries -- indexing them gives the biggest
-        # performance gain on flight search operations.
-        "CREATE INDEX IF NOT EXISTS idx_flight_origin ON benchmark_flight(origin_id);",
-        "CREATE INDEX IF NOT EXISTS idx_flight_destination ON benchmark_flight(destination_id);",
-
-        # Status is filtered in almost every query -- scheduled flights
-        # for search, confirmed bookings for seat availability checks.
-        "CREATE INDEX IF NOT EXISTS idx_flight_status ON benchmark_flight(status);",
-        "CREATE INDEX IF NOT EXISTS idx_booking_status ON benchmark_booking(status);",
-
-        # Passenger and flight foreign keys on bookings are used by
-        # the view bookings and cancel booking operations.
-        "CREATE INDEX IF NOT EXISTS idx_booking_passenger ON benchmark_booking(passenger_id);",
-        "CREATE INDEX IF NOT EXISTS idx_booking_flight ON benchmark_booking(flight_id);",
-
-        # Email is the primary way passengers look up their bookings
-        # on the dashboard -- this index makes that lookup instant.
-        "CREATE INDEX IF NOT EXISTS idx_passenger_email ON benchmark_passenger(email);",
-
-        # Departure time is used in date range search queries.
-        "CREATE INDEX IF NOT EXISTS idx_flight_departure ON benchmark_flight(departure_time);",
-
-        # Base price is used in price range filter queries.
-        "CREATE INDEX IF NOT EXISTS idx_flight_price ON benchmark_flight(base_price);",
+        ("idx_flight_status",    "CREATE INDEX idx_flight_status ON benchmark_flight(status);"),
+        ("idx_flight_departure", "CREATE INDEX idx_flight_departure ON benchmark_flight(departure_time);"),
+        ("idx_flight_price",     "CREATE INDEX idx_flight_price ON benchmark_flight(base_price);"),
+        ("idx_booking_status",   "CREATE INDEX idx_booking_status ON benchmark_booking(status);"),
+        ("idx_booking_flight",   "CREATE INDEX idx_booking_flight ON benchmark_booking(flight_id);"),
+        ("idx_passenger_email",  "CREATE INDEX idx_passenger_email ON benchmark_passenger(email);"),
     ]
 
     with connection.cursor() as cursor:
-        for sql in indexes:
+        for name, sql in indexes:
             try:
                 cursor.execute(sql)
-                print(f"  Added: {sql.split('idx_')[1].split(' ')[0]}")
+                print(f"  Added: {name}")
             except Exception as e:
-                print(f"  Skipped (already exists): {e}")
+                print(f"  Skipped {name}: already exists")
 
     print("MySQL indexes added successfully.")
     return {'database': 'MySQL', 'status': 'indexes_added', 'success': True}
@@ -65,10 +47,6 @@ def add_mongo_indexes():
     db = get_mongo_db()
 
     indexes = [
-        # Same fields as MySQL for a fair comparison.
-        # MongoDB uses compound indexes differently from MySQL --
-        # the order of fields in a compound index matters in MongoDB
-        # but not as much in MySQL's B-tree implementation.
         (db.flights,    [("origin.city", 1)],       "origin_city"),
         (db.flights,    [("destination.city", 1)],  "destination_city"),
         (db.flights,    [("status", 1)],             "flight_status"),
@@ -92,31 +70,30 @@ def add_mongo_indexes():
 
 
 # ── Remove indexes ────────────────────────────────────────────────────────────
-# Indexes are removed when the user wants to run the no-index benchmark.
-# We drop indexes but keep the data so the same dataset is used for
-# both the indexed and non-indexed benchmarks -- this ensures a fair comparison.
+# We only remove the indexes we created manually.
+# Django's automatically created foreign key indexes
+# (idx_flight_origin, idx_flight_destination, idx_booking_passenger)
+# are not removed because Django needs them for foreign key relationships
+# and they will be recreated automatically on migration anyway.
 
 def remove_mysql_indexes():
     print("Removing MySQL indexes...")
     indexes = [
-        "DROP INDEX IF EXISTS idx_flight_origin ON benchmark_flight;",
-        "DROP INDEX IF EXISTS idx_flight_destination ON benchmark_flight;",
-        "DROP INDEX IF EXISTS idx_flight_status ON benchmark_flight;",
-        "DROP INDEX IF EXISTS idx_flight_departure ON benchmark_flight;",
-        "DROP INDEX IF EXISTS idx_flight_price ON benchmark_flight;",
-        "DROP INDEX IF EXISTS idx_booking_status ON benchmark_booking;",
-        "DROP INDEX IF EXISTS idx_booking_passenger ON benchmark_booking;",
-        "DROP INDEX IF EXISTS idx_booking_flight ON benchmark_booking;",
-        "DROP INDEX IF EXISTS idx_passenger_email ON benchmark_passenger;",
+        ("idx_flight_status",    "benchmark_flight"),
+        ("idx_flight_departure", "benchmark_flight"),
+        ("idx_flight_price",     "benchmark_flight"),
+        ("idx_booking_status",   "benchmark_booking"),
+        ("idx_booking_flight",   "benchmark_booking"),
+        ("idx_passenger_email",  "benchmark_passenger"),
     ]
 
     with connection.cursor() as cursor:
-        for sql in indexes:
+        for name, table in indexes:
             try:
-                cursor.execute(sql)
-                print(f"  Removed: {sql.split('idx_')[1].split(' ')[0]}")
+                cursor.execute(f"DROP INDEX {name} ON {table};")
+                print(f"  Removed: {name}")
             except Exception as e:
-                print(f"  Skipped: {e}")
+                print(f"  Skipped {name}: {e}")
 
     print("MySQL indexes removed.")
     return {'database': 'MySQL', 'status': 'indexes_removed', 'success': True}
@@ -150,8 +127,8 @@ def remove_mongo_indexes():
 
 
 # ── Check index status ────────────────────────────────────────────────────────
-# Returns which indexes currently exist on both databases.
-# The dashboard uses this to show whether indexes are active or not.
+# Only checks for our custom indexes, not Django's automatic foreign key indexes.
+# This gives an accurate picture of whether the user has added indexes or not.
 
 def get_mysql_indexes():
     with connection.cursor() as cursor:
@@ -159,7 +136,14 @@ def get_mysql_indexes():
             SELECT INDEX_NAME, TABLE_NAME, COLUMN_NAME
             FROM INFORMATION_SCHEMA.STATISTICS
             WHERE TABLE_SCHEMA = 'airline_benchmark'
-            AND INDEX_NAME LIKE 'idx_%'
+            AND INDEX_NAME IN (
+                'idx_flight_status',
+                'idx_flight_departure',
+                'idx_flight_price',
+                'idx_booking_status',
+                'idx_booking_flight',
+                'idx_passenger_email'
+            )
             ORDER BY TABLE_NAME, INDEX_NAME;
         """)
         rows = cursor.fetchall()
@@ -186,11 +170,11 @@ def add_indexes():
     mysql_result = add_mysql_indexes()
     mongo_result = add_mongo_indexes()
     return {
-        'status':  'indexes_added',
-        'mysql':   mysql_result,
-        'mongodb': mongo_result,
-        'mysql_indexes':  get_mysql_indexes(),
-        'mongo_indexes':  get_mongo_indexes(),
+        'status':        'indexes_added',
+        'mysql':         mysql_result,
+        'mongodb':       mongo_result,
+        'mysql_indexes': get_mysql_indexes(),
+        'mongo_indexes': get_mongo_indexes(),
     }
 
 

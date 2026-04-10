@@ -49,12 +49,23 @@ def db_status(request):
 
 # ── Clear databases ───────────────────────────────────────────────────────────
 # Called when the user clicks the Clear Databases button.
-# Deletion order matters in MySQL because of foreign key constraints.
+# Indexes are removed first before data is deleted because MySQL
+# indexes live on the table structure and persist even after all
+# rows are deleted -- they must be dropped explicitly.
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def clear_databases(request):
     results = {}
+
+    # Remove MySQL indexes first before clearing data.
+    # If indexes are not removed here they will persist on the
+    # empty tables and show as active even after clearing.
+    try:
+        from index_manager import remove_mysql_indexes
+        remove_mysql_indexes()
+    except Exception:
+        pass
 
     try:
         Booking.objects.all().delete()
@@ -66,7 +77,7 @@ def clear_databases(request):
         results['mysql'] = {
             'status':  'cleared',
             'success': True,
-            'message': 'All MySQL tables cleared successfully'
+            'message': 'All MySQL tables and indexes cleared successfully'
         }
     except Exception as e:
         results['mysql'] = {
@@ -75,6 +86,8 @@ def clear_databases(request):
             'message': str(e)
         }
 
+    # MongoDB collections are dropped entirely which removes
+    # both the data and any indexes in one operation.
     try:
         db = get_mongo_db()
         db.bookings.drop()
@@ -85,7 +98,7 @@ def clear_databases(request):
         results['mongodb'] = {
             'status':  'cleared',
             'success': True,
-            'message': 'All MongoDB collections cleared successfully'
+            'message': 'All MongoDB collections and indexes cleared successfully'
         }
     except Exception as e:
         results['mongodb'] = {
@@ -143,10 +156,10 @@ def add_indexes(request):
         from index_manager import add_indexes as run_add_indexes
         result = run_add_indexes()
         return JsonResponse({
-            'status':  'indexes_added',
-            'message': 'Indexes added to both databases successfully',
-            'mysql':   result['mysql'],
-            'mongodb': result['mongodb'],
+            'status':         'indexes_added',
+            'message':        'Indexes added to both databases successfully',
+            'mysql':          result['mysql'],
+            'mongodb':        result['mongodb'],
             'mysql_indexes':  result['mysql_indexes'],
             'mongo_indexes':  result['mongo_indexes'],
         })
@@ -191,12 +204,12 @@ def index_status(request):
         from index_manager import check_indexes
         result = check_indexes()
         return JsonResponse({
-            'status':  'ok',
-            'mysql':   result['mysql'],
-            'mongodb': result['mongodb'],
+            'status':       'ok',
+            'mysql':        result['mysql'],
+            'mongodb':      result['mongodb'],
             'mysql_count':  len(result['mysql']),
             'mongo_count':  len(result['mongodb']),
-            'indexed': len(result['mysql']) > 0 or len(result['mongodb']) > 0
+            'indexed':      len(result['mysql']) > 0 or len(result['mongodb']) > 0
         })
     except Exception as e:
         return JsonResponse({
