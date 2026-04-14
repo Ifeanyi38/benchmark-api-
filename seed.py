@@ -2,9 +2,8 @@ import os
 import django
 import random
 import string
-from datetime import timedelta
+from datetime import timedelta, datetime
 from decimal import Decimal
-from datetime import datetime
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'benchmark_project.settings')
 django.setup()
@@ -16,11 +15,6 @@ from bson import ObjectId, Decimal128
 
 fake = Faker()
 
-# Dataset size configurations.
-# Flights are intentionally higher than passengers to avoid seat conflicts
-# at large scales. With 20 aircraft types averaging 250 seats each,
-# 400,000 flights gives roughly 25 bookings per flight at 10m scale
-# which is well within the capacity of any aircraft type in our list.
 DATASET_SIZES = {
     '1k': {
         'passengers': 300,
@@ -54,9 +48,6 @@ DATASET_SIZES = {
     },
 }
 
-# 100 airports spread across every continent to ensure route variety.
-# More airports means more possible origin-destination combinations
-# which makes flight search queries more realistic and varied.
 AIRPORTS = [
     ("LHR", "Heathrow",              "London",        "UK"),
     ("JFK", "John F. Kennedy",       "New York",      "USA"),
@@ -160,10 +151,6 @@ AIRPORTS = [
     ("RGN", "Yangon Intl",           "Yangon",        "Myanmar"),
 ]
 
-# 20 aircraft types covering the full range from regional jets to
-# wide-body long-haul aircraft. The variety in seat capacity is
-# intentional -- it makes seat availability queries more interesting
-# because the number of available seats per flight varies significantly.
 AIRCRAFT_MODELS = [
     ("Boeing 737-800",       189),
     ("Boeing 737 MAX 8",     178),
@@ -187,16 +174,16 @@ AIRCRAFT_MODELS = [
     ("Bombardier CRJ-900",   90),
 ]
 
+BATCH_SIZE = 5000
 
-def random_booking_ref():
+
+def random_ref():
     return 'SK' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
 
 def generate_seats_mysql(aircraft, total_seats):
-    # Seat classes are assigned by row position.
-    # First class gets the first two rows, business gets the next 20%,
-    # and everything after that is economy. This mirrors real aircraft layouts.
-    rows = total_seats // 6
+    rows  = total_seats // 6
+    seats = []
     for row in range(1, rows + 1):
         for col in ['A', 'B', 'C', 'D', 'E', 'F']:
             if row <= 2:
@@ -205,62 +192,54 @@ def generate_seats_mysql(aircraft, total_seats):
                 seat_class = 'business'
             else:
                 seat_class = 'economy'
-            Seat.objects.get_or_create(
-                aircraft=aircraft,
-                seat_number=f"{row}{col}",
-                defaults={'seat_class': seat_class}
-            )
+            seats.append(Seat(
+                aircraft    = aircraft,
+                seat_number = f"{row}{col}",
+                seat_class  = seat_class,
+            ))
+    Seat.objects.bulk_create(seats, ignore_conflicts=True)
 
 
 # ── Clear functions ───────────────────────────────────────────────────────────
-# These are called by the Django API when the user clicks
-# the Clear Databases button on the dashboard. Deletion order
-# matters in MySQL because of foreign key constraints -- bookings
-# must be deleted before passengers and flights, and flights before
-# airports and aircraft.
 
 def clear_mysql():
     print("Clearing MySQL...")
-    Booking.objects.all().delete()
-    Passenger.objects.all().delete()
-    Flight.objects.all().delete()
-    Seat.objects.all().delete()
-    Aircraft.objects.all().delete()
-    Airport.objects.all().delete()
+    from django.db import connection
+    # TRUNCATE is instant regardless of record count.
+    # SET FOREIGN_KEY_CHECKS = 0 disables constraint validation temporarily
+    # so all tables can be truncated in any order without foreign key errors.
+    with connection.cursor() as cursor:
+        cursor.execute("SET FOREIGN_KEY_CHECKS = 0;")
+        cursor.execute("TRUNCATE TABLE benchmark_booking;")
+        cursor.execute("TRUNCATE TABLE benchmark_passenger;")
+        cursor.execute("TRUNCATE TABLE benchmark_flight;")
+        cursor.execute("TRUNCATE TABLE benchmark_seat;")
+        cursor.execute("TRUNCATE TABLE benchmark_aircraft;")
+        cursor.execute("TRUNCATE TABLE benchmark_airport;")
+        cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
     print("MySQL cleared successfully.")
-    return {
-        'database': 'MySQL',
-        'status':   'cleared',
-        'success':  True
-    }
+    return {'database': 'MySQL', 'status': 'cleared', 'success': True}
 
 
 def clear_mongo():
     print("Clearing MongoDB...")
     client = MongoClient('mongodb://localhost:27018/')
     db     = client['airline_benchmark']
-    # Drop each collection individually rather than dropping
-    # the entire database -- this preserves any indexes we have set up.
     db.bookings.drop()
     db.passengers.drop()
     db.flights.drop()
     db.aircraft.drop()
     db.airports.drop()
     print("MongoDB cleared successfully.")
-    return {
-        'database': 'MongoDB',
-        'status':   'cleared',
-        'success':  True
-    }
+    return {'database': 'MongoDB', 'status': 'cleared', 'success': True}
 
 
-# ── MySQL seed function ───────────────────────────────────────────────────────
+# ── MySQL seed ────────────────────────────────────────────────────────────────
 
 def seed_mysql(num_passengers, num_flights, num_bookings):
     print(f"\nSeeding MySQL -- {num_passengers} passengers, {num_flights} flights, {num_bookings} bookings")
 
-    # Airports -- use get_or_create because airports are reference data
-    # that should not be duplicated if the function is called multiple times.
+    # Airports
     airport_objs = []
     for code, name, city, country in AIRPORTS:
         obj, _ = Airport.objects.get_or_create(
@@ -270,56 +249,49 @@ def seed_mysql(num_passengers, num_flights, num_bookings):
         airport_objs.append(obj)
     print(f"  {len(airport_objs)} airports ready")
 
-    # Aircraft and their seats -- seats are generated once per aircraft
-    # type and reused across all flights that use that aircraft.
+    # Aircraft and seats
     aircraft_objs = []
     for model, total in AIRCRAFT_MODELS:
         ac, created = Aircraft.objects.get_or_create(
-            model=model,
-            defaults={'total_seats': total}
+            model=model, defaults={'total_seats': total}
         )
         aircraft_objs.append(ac)
         if created:
             generate_seats_mysql(ac, total)
     print(f"  {len(aircraft_objs)} aircraft ready")
 
-    # Passengers -- each one gets a unique email and passport number.
-    # Faker's unique proxy ensures no duplicates within a single run.
-    passengers = []
-    for _ in range(num_passengers):
-        try:
-            p = Passenger.objects.create(
-                first_name      = fake.first_name(),
-                last_name       = fake.last_name(),
-                email           = fake.unique.email(),
-                phone           = fake.phone_number()[:20],
-                passport_number = fake.unique.bothify('??#######'),
-                date_of_birth   = fake.date_of_birth(minimum_age=18, maximum_age=80),
-            )
-            passengers.append(p)
-        except Exception:
-            # Skip if a duplicate email or passport number is generated.
-            # This is rare but possible with very large datasets.
-            pass
-    print(f"  {len(passengers)} passengers created")
+    # Passengers
+    print(f"  Creating {num_passengers} passengers...")
+    passenger_batch = []
+    for i in range(num_passengers):
+        passenger_batch.append(Passenger(
+            first_name      = fake.first_name(),
+            last_name       = fake.last_name(),
+            email           = f"{fake.user_name()}_{i}@benchmark.com",
+            phone           = fake.phone_number()[:20],
+            passport_number = f"PP{i:09d}",
+            date_of_birth   = fake.date_of_birth(minimum_age=18, maximum_age=80),
+        ))
+        if len(passenger_batch) >= BATCH_SIZE:
+            Passenger.objects.bulk_create(passenger_batch, ignore_conflicts=True)
+            passenger_batch = []
+            print(f"    {i + 1} passengers inserted...")
+    if passenger_batch:
+        Passenger.objects.bulk_create(passenger_batch, ignore_conflicts=True)
+    all_passengers = list(Passenger.objects.values_list('id', flat=True))
+    print(f"  {len(all_passengers)} passengers created")
 
-    # Flights -- flight numbers use a 4-digit suffix to support up to
-    # 9000 unique flights before collision risk becomes significant.
-    flights      = []
-    used_numbers = set()
-    for _ in range(num_flights):
+    # Flights
+    print(f"  Creating {num_flights} flights...")
+    flight_batch = []
+    for i in range(num_flights):
         origin, destination = random.sample(airport_objs, 2)
         aircraft  = random.choice(aircraft_objs)
         departure = fake.date_time_between(start_date='+1d', end_date='+365d')
         duration  = timedelta(hours=random.randint(1, 16))
 
-        fn = f"SK{random.randint(1000, 9999)}"
-        while fn in used_numbers:
-            fn = f"SK{random.randint(1000, 9999)}"
-        used_numbers.add(fn)
-
-        f = Flight.objects.create(
-            flight_number  = fn,
+        flight_batch.append(Flight(
+            flight_number  = f"SK{i:06d}",
             aircraft       = aircraft,
             origin         = origin,
             destination    = destination,
@@ -327,53 +299,72 @@ def seed_mysql(num_passengers, num_flights, num_bookings):
             arrival_time   = departure + duration,
             base_price     = Decimal(str(round(random.uniform(49, 1500), 2))),
             status         = 'scheduled',
-        )
-        flights.append(f)
-    print(f"  {len(flights)} flights created")
+        ))
+        if len(flight_batch) >= BATCH_SIZE:
+            Flight.objects.bulk_create(flight_batch, ignore_conflicts=True)
+            flight_batch = []
+            print(f"    {i + 1} flights inserted...")
+    if flight_batch:
+        Flight.objects.bulk_create(flight_batch, ignore_conflicts=True)
+    all_flights = list(Flight.objects.values_list('id', 'aircraft_id'))
+    print(f"  {len(all_flights)} flights created")
 
-    # Bookings -- we track which seat has been booked on which flight
-    # to prevent duplicate seat assignments on the same flight.
-    booked     = 0
-    used_refs  = set()
-    used_seats = set()
+    # Build seat map in memory
+    seat_map = {}
+    for seat in Seat.objects.values('id', 'aircraft_id'):
+        ac_id = seat['aircraft_id']
+        if ac_id not in seat_map:
+            seat_map[ac_id] = []
+        seat_map[ac_id].append(seat['id'])
+
+    # Bookings
+    print(f"  Creating {num_bookings} bookings...")
+    booking_batch = []
+    used_refs     = set()
+    used_seats    = set()
+    booked        = 0
 
     for _ in range(num_bookings):
-        flight    = random.choice(flights)
-        passenger = random.choice(passengers)
-        seats     = list(Seat.objects.filter(aircraft=flight.aircraft))
-        available = [s for s in seats if (flight.id, s.id) not in used_seats]
+        flight_id, aircraft_id = random.choice(all_flights)
+        passenger_id = random.choice(all_passengers)
+        seats        = seat_map.get(aircraft_id, [])
+        available    = [s for s in seats if (flight_id, s) not in used_seats]
 
         if not available:
-            # All seats on this flight are taken -- skip and try another flight.
             continue
 
-        seat = random.choice(available)
-        ref  = random_booking_ref()
+        seat_id = random.choice(available)
+        ref     = random_ref()
         while ref in used_refs:
-            ref = random_booking_ref()
+            ref = random_ref()
 
         used_refs.add(ref)
-        used_seats.add((flight.id, seat.id))
+        used_seats.add((flight_id, seat_id))
 
-        # 75% of bookings are confirmed, 25% are cancelled.
-        # This ratio gives enough cancelled bookings to make
-        # the cancel/update benchmark meaningful.
-        Booking.objects.create(
-            passenger         = passenger,
-            flight            = flight,
-            seat              = seat,
+        booking_batch.append(Booking(
+            passenger_id      = passenger_id,
+            flight_id         = flight_id,
+            seat_id           = seat_id,
             booking_reference = ref,
             status            = random.choice(['confirmed', 'confirmed', 'confirmed', 'cancelled']),
-            total_price       = flight.base_price,
-        )
+            total_price       = Decimal(str(round(random.uniform(49, 1500), 2))),
+        ))
         booked += 1
+
+        if len(booking_batch) >= BATCH_SIZE:
+            Booking.objects.bulk_create(booking_batch, ignore_conflicts=True)
+            booking_batch = []
+            print(f"    {booked} bookings inserted...")
+
+    if booking_batch:
+        Booking.objects.bulk_create(booking_batch, ignore_conflicts=True)
 
     print(f"  {booked} bookings created")
     print("MySQL seeding complete.")
     return booked
 
 
-# ── MongoDB seed function ─────────────────────────────────────────────────────
+# ── MongoDB seed ──────────────────────────────────────────────────────────────
 
 def seed_mongo(num_passengers, num_flights, num_bookings):
     print(f"\nSeeding MongoDB -- {num_passengers} passengers, {num_flights} flights, {num_bookings} bookings")
@@ -395,10 +386,7 @@ def seed_mongo(num_passengers, num_flights, num_bookings):
     db.airports.insert_many(airport_docs)
     print(f"  {len(airport_docs)} airports created")
 
-    # Aircraft with seats embedded directly in the document.
-    # This is the key structural difference from MySQL -- instead of
-    # a separate seats table with foreign keys, MongoDB stores seat
-    # definitions inside the aircraft document itself.
+    # Aircraft with embedded seats
     aircraft_docs = []
     for model, total in AIRCRAFT_MODELS:
         rows  = total // 6
@@ -425,27 +413,19 @@ def seed_mongo(num_passengers, num_flights, num_bookings):
     db.aircraft.insert_many(aircraft_docs)
     print(f"  {len(aircraft_docs)} aircraft created")
 
-    # Flights with origin and destination embedded as snapshots.
-    # Embedding airport info avoids the need for a join when searching
-    # for flights by city -- the city name is stored directly in the
-    # flight document so MongoDB can filter without touching another collection.
-    flight_docs  = []
-    used_numbers = set()
-    for _ in range(num_flights):
+    # Flights
+    print(f"  Creating {num_flights} flights...")
+    flight_docs = []
+    for i in range(num_flights):
         origin      = random.choice(airport_docs)
         destination = random.choice([a for a in airport_docs if a != origin])
         aircraft    = random.choice(aircraft_docs)
         departure   = fake.date_time_between(start_date='+1d', end_date='+365d')
         duration    = timedelta(hours=random.randint(1, 16))
 
-        fn = f"SK{random.randint(1000, 9999)}"
-        while fn in used_numbers:
-            fn = f"SK{random.randint(1000, 9999)}"
-        used_numbers.add(fn)
-
-        doc = {
+        flight_docs.append({
             "_id":            ObjectId(),
-            "flight_number":  fn,
+            "flight_number":  f"SK{i:06d}",
             "aircraft_id":    aircraft["_id"],
             "origin": {
                 "code":    origin["code"],
@@ -461,100 +441,123 @@ def seed_mongo(num_passengers, num_flights, num_bookings):
             "arrival_time":   departure + duration,
             "base_price":     Decimal128(str(round(random.uniform(49, 1500), 2))),
             "status":         "scheduled",
-        }
-        flight_docs.append(doc)
-    db.flights.insert_many(flight_docs)
-    print(f"  {len(flight_docs)} flights created")
+        })
+
+        if len(flight_docs) >= BATCH_SIZE:
+            db.flights.insert_many(flight_docs)
+            flight_docs = []
+            print(f"    {i + 1} flights inserted...")
+
+    if flight_docs:
+        db.flights.insert_many(flight_docs)
+
+    all_flight_docs = list(db.flights.find(
+        {},
+        {'_id': 1, 'aircraft_id': 1, 'flight_number': 1,
+         'origin': 1, 'destination': 1, 'departure_time': 1, 'base_price': 1}
+    ))
+    print(f"  {len(all_flight_docs)} flights created")
 
     # Passengers
-    passenger_docs = []
-    for _ in range(num_passengers):
+    print(f"  Creating {num_passengers} passengers...")
+    passenger_docs    = []
+    all_passenger_ids = []
+    for i in range(num_passengers):
         doc = {
             "_id":             ObjectId(),
             "first_name":      fake.first_name(),
             "last_name":       fake.last_name(),
-            "email":           fake.unique.email(),
+            "email":           f"{fake.user_name()}_{i}@benchmark.com",
             "phone":           fake.phone_number()[:20],
-            "passport_number": fake.unique.bothify('??#######'),
+            "passport_number": f"PP{i:09d}",
             "date_of_birth":   datetime.combine(
                 fake.date_of_birth(minimum_age=18, maximum_age=80),
                 datetime.min.time()
             ),
         }
         passenger_docs.append(doc)
-    db.passengers.insert_many(passenger_docs)
-    print(f"  {len(passenger_docs)} passengers created")
+        all_passenger_ids.append(doc['_id'])
 
-    # Bookings with embedded snapshots of passenger and flight data.
-    # The snapshot pattern means a booking document contains everything
-    # needed to display a booking confirmation -- no joins required.
-    # This is the main reason MongoDB tends to be faster for read-heavy
-    # operations like viewing booking history.
+        if len(passenger_docs) >= BATCH_SIZE:
+            db.passengers.insert_many(passenger_docs)
+            passenger_docs = []
+            print(f"    {i + 1} passengers inserted...")
+
+    if passenger_docs:
+        db.passengers.insert_many(passenger_docs)
+    print(f"  {len(all_passenger_ids)} passengers created")
+
+    # Build aircraft seat map
+    aircraft_seat_map = {a['_id']: a['seats'] for a in aircraft_docs}
+
+    # Bookings
+    print(f"  Creating {num_bookings} bookings...")
     booking_docs = []
     used_refs    = set()
     used_seats   = set()
+    booked       = 0
 
     for _ in range(num_bookings):
-        flight    = random.choice(flight_docs)
-        passenger = random.choice(passenger_docs)
-        aircraft  = next(a for a in aircraft_docs if a["_id"] == flight["aircraft_id"])
-        available = [
-            s for s in aircraft["seats"]
-            if (str(flight["_id"]), s["seat_number"]) not in used_seats
+        flight       = random.choice(all_flight_docs)
+        passenger_id = random.choice(all_passenger_ids)
+        seats        = aircraft_seat_map.get(flight['aircraft_id'], [])
+        available    = [
+            s for s in seats
+            if (str(flight['_id']), s['seat_number']) not in used_seats
         ]
 
         if not available:
             continue
 
         seat = random.choice(available)
-        ref  = random_booking_ref()
+        ref  = random_ref()
         while ref in used_refs:
-            ref = random_booking_ref()
+            ref = random_ref()
 
         used_refs.add(ref)
-        used_seats.add((str(flight["_id"]), seat["seat_number"]))
+        used_seats.add((str(flight['_id']), seat['seat_number']))
 
-        doc = {
+        booking_docs.append({
             "_id":               ObjectId(),
-            "passenger_id":      passenger["_id"],
-            "flight_id":         flight["_id"],
+            "passenger_id":      passenger_id,
+            "flight_id":         flight['_id'],
             "booking_reference": ref,
             "status":            random.choice(['confirmed', 'confirmed', 'confirmed', 'cancelled']),
-            "total_price":       flight["base_price"],
+            "total_price":       flight['base_price'],
             "booked_at":         datetime.utcnow(),
             "seat": {
-                "seat_number": seat["seat_number"],
-                "seat_class":  seat["seat_class"],
+                "seat_number": seat['seat_number'],
+                "seat_class":  seat['seat_class'],
             },
-            # Passenger snapshot stored at booking time so the booking
-            # record remains accurate even if the passenger updates their details later.
             "passenger_snapshot": {
-                "first_name":      passenger["first_name"],
-                "last_name":       passenger["last_name"],
-                "email":           passenger["email"],
-                "passport_number": passenger["passport_number"],
+                "first_name":      fake.first_name(),
+                "last_name":       fake.last_name(),
+                "email":           f"snapshot_{booked}@benchmark.com",
+                "passport_number": f"PP{booked:09d}",
             },
-            # Flight snapshot stored at booking time for the same reason.
             "flight_snapshot": {
-                "flight_number":  flight["flight_number"],
-                "origin":         flight["origin"]["code"],
-                "destination":    flight["destination"]["code"],
-                "departure_time": flight["departure_time"],
+                "flight_number":  flight['flight_number'],
+                "origin":         flight['origin']['code'],
+                "destination":    flight['destination']['code'],
+                "departure_time": flight['departure_time'],
             },
-        }
-        booking_docs.append(doc)
+        })
+        booked += 1
+
+        if len(booking_docs) >= BATCH_SIZE:
+            db.bookings.insert_many(booking_docs)
+            booking_docs = []
+            print(f"    {booked} bookings inserted...")
 
     if booking_docs:
         db.bookings.insert_many(booking_docs)
-    print(f"  {len(booking_docs)} bookings created")
+
+    print(f"  {booked} bookings created")
     print("MongoDB seeding complete.")
-    return len(booking_docs)
+    return booked
 
 
-# ── Main entry point called by the Django API ─────────────────────────────────
-# The dashboard sends a POST request with the selected size (e.g. '1k', '50k').
-# This function clears both databases, resets Faker's unique value tracker,
-# then seeds both databases with identical data so the comparison is fair.
+# ── Main entry point ──────────────────────────────────────────────────────────
 
 def run_seed(size='1k'):
     if size not in DATASET_SIZES:
@@ -565,26 +568,19 @@ def run_seed(size='1k'):
     num_flights    = config['flights']
     num_bookings   = config['bookings']
 
-    # Reset Faker's unique tracker and random seed before each run
-    # so the data generated is consistent and reproducible.
     fake.unique.clear()
     random.seed(42)
 
     print(f"\nStarting seed for dataset size: {size}")
     print(f"Target: {num_passengers} passengers | {num_flights} flights | {num_bookings} bookings")
 
-    # Clear both databases before seeding
-    mysql_clear  = clear_mysql()
-    mongo_clear  = clear_mongo()
+    clear_mysql()
+    clear_mongo()
 
-    # Seed both databases with identical configuration
-    mysql_bookings = seed_mysql(num_passengers, num_flights, num_bookings)
-    mongo_bookings = seed_mongo(num_passengers, num_flights, num_bookings)
+    seed_mysql(num_passengers, num_flights, num_bookings)
+    seed_mongo(num_passengers, num_flights, num_bookings)
 
-    # Return a summary that the API sends back to the dashboard
-    # so the frontend can display the verification counts.
     from benchmark.models import Airport, Aircraft, Flight, Passenger, Booking
-    from pymongo import MongoClient
     mongo_client = MongoClient('mongodb://localhost:27018/')
     mongo_db     = mongo_client['airline_benchmark']
 
@@ -597,7 +593,7 @@ def run_seed(size='1k'):
             'flights':    Flight.objects.count(),
             'passengers': Passenger.objects.count(),
             'bookings':   Booking.objects.count(),
-            'cleared':    mysql_clear['success'],
+            'cleared':    True,
             'seeded':     True,
         },
         'mongodb': {
@@ -606,16 +602,13 @@ def run_seed(size='1k'):
             'flights':    mongo_db.flights.count_documents({}),
             'passengers': mongo_db.passengers.count_documents({}),
             'bookings':   mongo_db.bookings.count_documents({}),
-            'cleared':    mongo_clear['success'],
+            'cleared':    True,
             'seeded':     True,
         }
     }
 
 
 # ── Terminal usage ────────────────────────────────────────────────────────────
-# The seed can also be triggered from the terminal for testing.
-# Usage: python seed.py 1k
-# If no argument is given it defaults to 1k.
 
 if __name__ == '__main__':
     import sys
@@ -623,5 +616,5 @@ if __name__ == '__main__':
     print(f"Running seed from terminal with size: {size}")
     result = run_seed(size)
     print(f"\nSeed complete. Summary:")
-    print(f"  MySQL    -- {result['mysql']['passengers']} passengers | {result['mysql']['flights']} flights | {result['mysql']['bookings']} bookings")
-    print(f"  MongoDB  -- {result['mongodb']['passengers']} passengers | {result['mongodb']['flights']} flights | {result['mongodb']['bookings']} bookings")
+    print(f"  MySQL   -- {result['mysql']['passengers']} passengers | {result['mysql']['flights']} flights | {result['mysql']['bookings']} bookings")
+    print(f"  MongoDB -- {result['mongodb']['passengers']} passengers | {result['mongodb']['flights']} flights | {result['mongodb']['bookings']} bookings")

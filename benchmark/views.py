@@ -1,20 +1,19 @@
 import json
+from django.db import connection
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from benchmark.models import Airport, Aircraft, Flight, Seat, Passenger, Booking
 from pymongo import MongoClient
 
+# Global flag to stop seeding if clear is clicked mid-seed
+seeding_active = False
+
 
 def get_mongo_db():
     client = MongoClient('mongodb://localhost:27018/')
     return client['airline_benchmark']
 
-
-# ── Database status ───────────────────────────────────────────────────────────
-# Returns current record counts for both databases.
-# The dashboard calls this on load and after every seed or clear
-# to update the status panel showing how many records exist.
 
 @require_http_methods(["GET"])
 def db_status(request):
@@ -42,42 +41,44 @@ def db_status(request):
         mongo_counts = {'error': str(e)}
 
     return JsonResponse({
-        'mysql':   mysql_counts,
-        'mongodb': mongo_counts,
+        'mysql':          mysql_counts,
+        'mongodb':        mongo_counts,
+        'seeding_active': seeding_active,
     })
 
-
-# ── Clear databases ───────────────────────────────────────────────────────────
-# Called when the user clicks the Clear Databases button.
-# Indexes are removed first before data is deleted because MySQL
-# indexes live on the table structure and persist even after all
-# rows are deleted -- they must be dropped explicitly.
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def clear_databases(request):
+    global seeding_active
+    seeding_active = False
+
     results = {}
 
-    # Remove MySQL indexes first before clearing data.
-    # If indexes are not removed here they will persist on the
-    # empty tables and show as active even after clearing.
     try:
         from index_manager import remove_mysql_indexes
         remove_mysql_indexes()
     except Exception:
         pass
 
+    # TRUNCATE is instant regardless of record count.
+    # SET FOREIGN_KEY_CHECKS = 0 disables constraint validation
+    # temporarily so tables can be truncated in any order without
+    # foreign key errors.
     try:
-        Booking.objects.all().delete()
-        Passenger.objects.all().delete()
-        Flight.objects.all().delete()
-        Seat.objects.all().delete()
-        Aircraft.objects.all().delete()
-        Airport.objects.all().delete()
+        with connection.cursor() as cursor:
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 0;")
+            cursor.execute("TRUNCATE TABLE benchmark_booking;")
+            cursor.execute("TRUNCATE TABLE benchmark_passenger;")
+            cursor.execute("TRUNCATE TABLE benchmark_flight;")
+            cursor.execute("TRUNCATE TABLE benchmark_seat;")
+            cursor.execute("TRUNCATE TABLE benchmark_aircraft;")
+            cursor.execute("TRUNCATE TABLE benchmark_airport;")
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
         results['mysql'] = {
             'status':  'cleared',
             'success': True,
-            'message': 'All MySQL tables and indexes cleared successfully'
+            'message': 'All MySQL tables cleared successfully'
         }
     except Exception as e:
         results['mysql'] = {
@@ -86,8 +87,6 @@ def clear_databases(request):
             'message': str(e)
         }
 
-    # MongoDB collections are dropped entirely which removes
-    # both the data and any indexes in one operation.
     try:
         db = get_mongo_db()
         db.bookings.drop()
@@ -98,7 +97,7 @@ def clear_databases(request):
         results['mongodb'] = {
             'status':  'cleared',
             'success': True,
-            'message': 'All MongoDB collections and indexes cleared successfully'
+            'message': 'All MongoDB collections cleared successfully'
         }
     except Exception as e:
         results['mongodb'] = {
@@ -114,14 +113,17 @@ def clear_databases(request):
     return JsonResponse(results)
 
 
-# ── Seed databases ────────────────────────────────────────────────────────────
-# Called when the user clicks Seed Databases after selecting a dataset size.
-# Runs the seed script and returns verification counts so the dashboard
-# can confirm both databases received identical data.
-
 @csrf_exempt
 @require_http_methods(["POST"])
 def seed_databases(request):
+    global seeding_active
+
+    if seeding_active:
+        return JsonResponse({
+            'status':  'error',
+            'message': 'Seeding is already in progress. Please wait or clear the databases first.'
+        }, status=400)
+
     try:
         body = json.loads(request.body)
         size = body.get('size', '1k')
@@ -129,8 +131,10 @@ def seed_databases(request):
         size = '1k'
 
     try:
+        seeding_active = True
         from seed import run_seed
         result = run_seed(size)
+        seeding_active = False
         return JsonResponse({
             'status':  'seeded',
             'message': f'Both databases seeded successfully with {size} dataset',
@@ -139,15 +143,12 @@ def seed_databases(request):
             'mongodb': result['mongodb'],
         })
     except Exception as e:
+        seeding_active = False
         return JsonResponse({
             'status':  'error',
             'message': str(e)
         }, status=500)
 
-
-# ── Add indexes ───────────────────────────────────────────────────────────────
-# Called when the user clicks Add Indexes on the dashboard.
-# Indexes are added after seeding so they are built on real data.
 
 @csrf_exempt
 @require_http_methods(["POST"])
@@ -170,11 +171,6 @@ def add_indexes(request):
         }, status=500)
 
 
-# ── Remove indexes ────────────────────────────────────────────────────────────
-# Called when the user clicks Remove Indexes.
-# Removes indexes but keeps the data so the same dataset
-# can be benchmarked with and without indexes for comparison.
-
 @csrf_exempt
 @require_http_methods(["POST"])
 def remove_indexes(request):
@@ -194,22 +190,18 @@ def remove_indexes(request):
         }, status=500)
 
 
-# ── Check index status ────────────────────────────────────────────────────────
-# Called by the dashboard on load and after add/remove index operations
-# to show which indexes are currently active on both databases.
-
 @require_http_methods(["GET"])
 def index_status(request):
     try:
         from index_manager import check_indexes
         result = check_indexes()
         return JsonResponse({
-            'status':       'ok',
-            'mysql':        result['mysql'],
-            'mongodb':      result['mongodb'],
-            'mysql_count':  len(result['mysql']),
-            'mongo_count':  len(result['mongodb']),
-            'indexed':      len(result['mysql']) > 0 or len(result['mongodb']) > 0
+            'status':      'ok',
+            'mysql':       result['mysql'],
+            'mongodb':     result['mongodb'],
+            'mysql_count': len(result['mysql']),
+            'mongo_count': len(result['mongodb']),
+            'indexed':     len(result['mysql']) > 0 or len(result['mongodb']) > 0
         })
     except Exception as e:
         return JsonResponse({
@@ -217,11 +209,6 @@ def index_status(request):
             'message': str(e)
         }, status=500)
 
-
-# ── Run benchmark ─────────────────────────────────────────────────────────────
-# Called when the user clicks Run Benchmark.
-# The request body contains a list of selected operation keys
-# from the dashboard checkboxes, or 'all' to run everything.
 
 @csrf_exempt
 @require_http_methods(["POST"])
@@ -249,10 +236,6 @@ def run_benchmark(request):
             'message': str(e)
         }, status=500)
 
-
-# ── Get available operations ──────────────────────────────────────────────────
-# Called when the dashboard loads to populate the operation
-# checkboxes with the correct labels and categories.
 
 @require_http_methods(["GET"])
 def get_operations(request):
